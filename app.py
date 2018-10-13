@@ -1,67 +1,195 @@
-import json
+import jwt
+import bcrypt
 
-from flask_cors    import CORS
-from flask import Flask, jsonify, request
+from sqlalchemy import create_engine, text
+from flask import Flask, jsonify, request, Response, g, current_app
+from flask_cors import CORS
+from functools import wraps
+from datetime import datetime, timedelta
 
-# app 은 앞으로 사용할 서버의 이름
-# __name__ : 이름을 대체해주는 환경변수 (그때그때 모듈네임을 알아서 입력)
+################################
+# Authentication wrapper
+################################
+def decode(access_token):
+    try:
+        payload = jwt.decode(access_token, current_app.config['JWT_SECRET_KEY'], 'HS256')
+    except jwt.InvalidTokenError:
+        payload = None
 
-app = Flask(__name__)
-app.debug = True
-# 코드를 고치면 알아서 디버깅을 해줌
+    return payload
 
-# list 안에 dictunary 가 있는데, 이것보다 더 빠른 정보탐색을 하는 방법?
-# 이중 딕셔너리 : 각 딕셔너리에 key 값을 새로 부여한다.
+def get_user_info(id):
+    sql = text("""
+        SELECT
+            u.id,
+            u.name,
+            u.email,
+            accnt.account_type
+        FROM users as u
+        JOIN accounts accnt ON u.account_id = accnt.id
+        WHERE u.id = :id
+    """)
+    parameters = {'id' : id}
+    row        = current_app.database.execute(sql, parameters).fetchone()
 
-# users = [
-users = {
-	1: {
-		'id' : 1,
-		'name' : '이예원',
-		'account_type' : 'PREMIUM'
-	},
-	2: {
-		'id' : 2,
-		'name' : '예원',
-		'account_type' : 'BASIC'
-	}
-#]
-}
+    return {
+        'id'           : row['id'],
+        'name'         : row['name'],
+        'email'        : row['email'],
+        'account_type' : row['account_type']
+    }  if row else None
 
-CORS(app)
-# endpoint 로 decorator 를 달고 서버에 핑 보내면 404 에러가 뜸
-# 데코레이터를 route 로 변경후 재실행
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        access_token = request.headers.get('Authorization')
 
-@app.route('/users', methods=['GET', 'POST'])
-def all_users():
-	# 이중 딕셔너리를 써서 지금 리스트 형식이 아니므로
-	# return 해줄때는 jsonify 안에 list 로 감싼다음, value 값만 리턴 해준다
-	# 작은 딕셔너리 자체가 앞에 인덱싱 넘버를 달게 됨으로써 그 자체가 value 가 됨
-	"""return jsonify(users)"""
-	return jsonify(list(users.values()))
+        if access_token is not None:
+            payload = decode(access_token)
 
-@app.route('/user/<int:id>', methods=['GET']) ## /user/1
-def get_user(id):
-	user = None
-	
-	# 아래 for loop 보다 훨씬 빠르게 정보탐색 가능 (이중 딕셔너리)
-	if (id in users):
-		return jsonify(users[id]) 
-	"""for u in users:
-		if u['id'] == id:
-			return jsonify(u)
+            if payload is None: return Response(status=401)
 
-	return '', 404""" 
+            user_id   = payload['user_id']
+            g.user_id = user_id
+            g.user    = get_user_info(user_id) if user_id else None
+        else:
+            return Response(status = 401)
 
-@app.route('/ping', methods=['GET'])
-def ping():
-	return 'pong'
+        return f(*args, **kwargs)
+    return decorated_function
 
-@app.route('/user', methods=['POST'])
-def create_user():
-	# json 파일을 받아오고 dictionary 파일로 변환해줌
-	new_user = request.json
-	# my_dict[2] = "내용" << 이렇게 추가하는거랑 똑같음, key 와 value 를추가함
-	users[new_user['id']] = new_user
-	
-	return '', 200
+def vip_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = getattr(g, 'user', None)
+
+        if not user or not user['account_type'] == 'VIP':
+            return Response(status = 401)
+
+        return f(*args, **kwargs)
+
+    return decorated_function
+
+
+def create_app(test_config = None):
+    app = Flask(__name__)
+    app.debug = True
+
+    if test_config is None:
+        app.config.from_pyfile("config.py")
+    else:
+        print(f"test config == {test_config}")
+        app.config.update(test_config)
+
+    database     = create_engine(app.config['DB_URL'], encoding = 'utf-8', max_overflow = 0)
+    app.database = database
+
+
+    CORS(app)
+
+    @app.route('/ping', methods=['GET'])
+    def ping():
+        return jsonify('{"name" : "pong"}')
+
+    @app.route('/users', methods=['GET'])
+    @login_required
+    @vip_required
+    def all_users():
+       rows = database.execute(text("""
+       SELECT
+           u.id,
+           u.name,
+           u.email,
+           accnt.account_type
+       FROM users as u
+       JOIN accounts accnt ON u.account_id = accnt.id
+       """)).fetchall()
+       if rows is None:
+           return '', 404
+       return jsonify([{
+           'id'            : row['id'],
+           'name'          : row['name'],
+           'email'         : row['email'],
+           'account_type'  : row['account_type']
+       }for row in rows])
+
+    @app.route('/user/<int:id>', methods=['GET'])  ## /user/1
+    def get_user(id):
+       sql = text("""
+           SELECT
+               u.id,
+               u.name,
+               u.email,
+               accnt.account_type
+           FROM users as u
+           JOIN accounts accnt ON u.account_id = accnt.id
+           WHERE u.id = :id
+           """)
+
+       parameters = {'id' : id}
+       row = database.execute(sql, parameters).fetchone()
+
+       return jsonify({
+           'id': row['id'],
+           'name': row['name'],
+           'email': row['email'],
+           'account_type': row['account_type']
+       }) if row else ('', 404)
+
+    @app.route('/login', methods=['POST'])
+    def login():
+        credential = request.json
+        email      = credential['email']
+        password   = credential['password']
+        row        = database.execute(text("""
+            SELECT
+                id,
+                hashed_password
+            FROM users
+            WHERE email = :email
+        """), {'email' : email}).fetchone()
+
+        if row and bcrypt.checkpw(password.encode('UTF-8'), row['hashed_password'].encode('UTF-8')):
+            user_id = row['id']
+            payload = {
+                'user_id' : user_id,
+                'exp'     : datetime.utcnow() + timedelta(seconds = app.config['JWT_EXP_DELTA_SECONDS'])
+            }
+            token = jwt.encode(payload, app.config['JWT_SECRET_KEY'], 'HS256')
+
+            return jsonify({
+                'access_token' : token.decode('UTF-8')
+            })
+        else:
+            return '', 401
+
+
+    @app.route('/user', methods=['POST'])
+    def create_user():
+        new_user             = request.json
+        new_user['password'] = bcrypt.hashpw(
+            new_user['password'].encode('UTF-8'),
+            bcrypt.gensalt()
+        )
+
+        print(f"new user ==> {new_user}")
+
+        rowcount = database.execute(text("""
+            INSERT INTO users (
+                name,
+                email,
+                hashed_password, account_id
+            ) SELECT
+                :name,
+                :email,
+                :password,
+                accnt.id
+            FROM accounts as accnt
+            WHERE accnt.account_type = :account_type
+        """), new_user).rowcount
+
+        print(f"row count == {rowcount}")
+
+        return ('', 200) if rowcount == 1 else ('', 500)
+
+    return app

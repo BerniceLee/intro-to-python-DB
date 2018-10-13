@@ -1,9 +1,9 @@
 db = {
-    'user'     : 'connectuser',
-    'password' : 'Connect123!@#',
-    'host'     : 'localhost',
-    'port'     : 5000,
-    'database' : 'practice1'
+    'user'     : 'root',
+    'password' : 'Youbastard123!',
+    'host'     : 'python-backend-test.c4uxqdncx4mg.ap-northeast-2.rds.amazonaws.com',
+    'port'     : 3306,
+    'database' : 'python_test'
 }
 
 DB_URL                = f"mysql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['database']}?charset=utf8"
